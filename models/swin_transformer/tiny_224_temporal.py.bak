@@ -1,0 +1,101 @@
+# models/swin_transformer/tiny_224_temporal.py
+import numpy as np
+model_cfg = dict(
+    backbone=dict(type='SwinTransformer', arch='tiny', img_size=224, drop_path_rate=0.2, drop_rate=0.2, in_channels=3),
+    neck=dict(type='GlobalAveragePooling'),
+    head=dict(
+        type='PhyTemporalHead',
+        in_channels=768,          # Swin-T 最后一层通道
+        cond_dim=3,
+        cond_embed=64,
+        feat_embed=256,
+        temporal='gru',           # 'gru' | 'tcn'
+        temporal_hidden=256,
+        temporal_layers=1,
+        tcn_layers=3,
+        dropout=0.1,
+        num_classes=2,
+        loss=dict(type='HuberLoss', delta=1.0),
+        reg_loss_weight=1.0,
+        cls_loss_weight=1.0,
+        monotonic_cfg=dict(
+            enabled=False, weight=0.01, eps=0.05, margin=0.0,
+            cond_order=['T','V','P'],
+            pos_dims_names=['V'], neg_dims_names=[]
+        ),
+        init_cfg=None
+    ),
+    init_cfg=[
+        dict(type='TruncNormal', layer='Linear', std=0.02, bias=0.),
+        dict(type='Constant', layer='LayerNorm', val=1., bias=0.)
+    ],
+)
+
+# TVP 标准化统计量（占位示例；请用训练集统计更新）
+tvp_means = [0.0, 0.0, 0.0]   # [mean_T, mean_V, mean_P]
+tvp_stds  = [1.0, 1.0, 1.0]   # [std_T, std_V, std_P]
+
+train_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='GrayscaleConversion', to_rgb=True),   # 灰度复制为 3 通道
+    dict(type='GammaCorrection', gamma=2.5, to_rgb=False),
+    dict(type='GaussianBlur', kernel_size=3, sigma=1),
+    dict(type='ImageToTensor', keys=['img']),
+    dict(type='ToTensor', keys=['T', 'V', 'P', 'k', 'stage']),
+    dict(type='StandardizeFields', keys=['T','V','P'], means=tvp_means, stds=tvp_stds),
+    dict(type='LogTransform', offset=1e-8, log_base=np.e),      # 仅作用于 k（已放入 results['k']）
+    dict(type='StandardizeLabels', mean=7.6045, std=0.4361),    # k 标准化（根据你的数据更新）
+    dict(type='Collect', keys=['img','T','V','P','k','stage','filename'])
+]
+
+valid_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='GrayscaleConversion', to_rgb=True),
+    dict(type='ImageToTensor', keys=['img']),
+    dict(type='ToTensor', keys=['T', 'V', 'P','k','stage']),
+    dict(type='StandardizeFields', keys=['T','V','P'], means=tvp_means, stds=tvp_stds),
+    dict(type='LogTransform', offset=1e-8, log_base=np.e),
+    dict(type='StandardizeLabels', mean=7.6045, std=0.4361),
+    dict(type='Collect', keys=['img','T','V','P','k','stage','filename'])
+]
+
+test_pipeline = valid_pipeline
+
+data_cfg = dict(
+    batch_size=4,      # 小 batch + 梯度累积
+    num_workers=2,
+    seq_len=8,
+    train=dict(
+        pretrained_flag=False,
+        pretrained_weights='',
+        freeze_flag=False,
+        freeze_layers=('backbone',),
+        epoches=80,
+        robust=dict(method='none', penalty_weight=1.0, eta=0.01),
+        accumulate_steps=4    # 梯度累积 4× -> 等效 bs=16
+    ),
+    valid=dict(batch_size=4, num_workers=2),
+    test=dict(
+        ckpt='',
+        metrics=['rmse','r2'],
+        metric_options=dict(thrs=None, average_mode='none')
+    )
+)
+
+# 更保守的 Adam 设置（未预训练 + 小 batch）
+optimizer_cfg = dict(
+    type='Adam',
+    lr=1e-4,
+    weight_decay=5e-3
+)
+
+# Cosine 退火 + warmup（按 epoch）
+lr_config = dict(
+    type='CosineAnnealingLrUpdater',
+    by_epoch=True,
+    min_lr_ratio=1e-3,
+    warmup='linear',
+    warmup_ratio=1e-3,
+    warmup_iters=3,
+    warmup_by_epoch=True
+)
